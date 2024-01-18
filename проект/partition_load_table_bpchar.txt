@@ -1,0 +1,95 @@
+CREATE OR REPLACE FUNCTION std3_69.partition_load_table_bpchar(table_name text, p_partition_key text, p_start_date timestamp, p_end_date timestamp, table_pxf text, user_id text, pass text)
+	RETURNS int4
+	LANGUAGE plpgsql
+	VOLATILE
+AS $$
+	
+declare 
+	ext_table_name text;
+	temp_table_name text;
+	table_name2 text;
+	ext_sql text;
+	ext_pxf text;
+	res text;
+	dist_key text;
+	params text;
+	ext_where text;
+	load_interval interval;
+	ext_start_date text;
+	ext_end_date text;
+	table_oid int;
+	cnt int8;
+begin
+	ext_table_name = table_name||'_external';
+	temp_table_name = table_name||'_tmp';
+	table_name2 = table_name||'2';
+
+	select c.oid
+	into table_oid
+	from pg_class as c inner join pg_namespace as n on c.relnamespace = n.oid
+	where n.nspname||'.'||c.relname = table_name
+	limit 1;
+
+	if table_oid = 0 or table_oid is null then
+		dist_key = 'DISTRIBUTED RANDOMLY';
+	else
+		dist_key = pg_get_table_distributedby(table_oid);
+	end if;
+
+	select coalesce ('with (' || array_to_string(reloptions, ', ') || ')','')
+	from pg_class 
+	into params
+	where oid = table_name::regclass;
+
+
+	ext_sql = 'DROP EXTERNAL TABLE IF EXISTS '||ext_table_name||';
+			   DROP TABLE IF EXISTS '||table_name2||';
+			   create table '||table_name2||'(like '||table_name||');
+			   alter table '||table_name2||' alter column '||p_partition_key||' type bpchar;';
+	raise notice 'TABLE2: %', ext_sql;
+	execute ext_sql;
+
+	load_interval = '1 month'::interval;
+	ext_start_date := date_trunc('month', p_start_date);
+	ext_end_date := date_trunc('month', p_start_date) + load_interval;
+	ext_where = 'to_date('||p_partition_key||', ''DDtMMtYYYY'')::date'||' >= '''||ext_start_date||'''::date AND '||'to_date('||p_partition_key||', ''DDtMMtYYYY'')'||' < '''||ext_end_date||'''::date';
+	ext_pxf = 'pxf://'||table_pxf||'?PROFILE=Jdbc&JDBC_DRIVER=org.postgresql.Driver&DB_URL=jdbc:postgresql://192.168.214.212:5432/postgres&USER='
+					||user_id||'&PASS='||pass;
+	raise notice 'PXF CONNECTION STRING: %', ext_pxf;
+
+	ext_sql = 'CREATE EXTERNAL TABLE '||ext_table_name||'(LIKE '||table_name2||')
+			LOCATION ('''||ext_pxf||''') ON ALL
+			FORMAT ''CUSTOM'' (FORMATTER=''pxfwritable_import'')
+			ENCODING ''UTF8''';
+	raise notice 'EXTERNAL TABLE: %', ext_sql;
+	execute ext_sql;
+
+	ext_sql = 'DROP TABLE IF EXISTS '||temp_table_name||';
+			    CREATE TABLE '||temp_table_name||' (LIKE '||table_name2||') ' ||params||' '||dist_key||';';	
+	raise notice 'TEMP TABLE: %', ext_sql;
+	execute ext_sql;
+
+	ext_sql = 'INSERT INTO '|| temp_table_name ||' SELECT * FROM '||ext_table_name||' WHERE '||ext_where;
+	raise notice 'INSERT from EXTERNAL: %', ext_sql;
+	execute ext_sql;
+	get diagnostics cnt = ROW_COUNT;
+	raise notice 'INSERTED ROWS: %', cnt;
+
+	ext_sql = 'alter table '||temp_table_name||' alter column date type date using(to_date(date, ''DDtMMtYYYY''))';
+	raise notice 'CHANGE tamp bpchar: %', ext_sql;
+	execute ext_sql;
+
+	execute 'insert into '||table_name||' select * from '||temp_table_name;
+	
+	ext_sql = 'ALTER TABLE '||table_name||' EXCHANGE PARTITION FOR (DATE '''||p_start_date||''') WITH TABLE '||temp_table_name||' WITH VALIDATION;';		
+	raise notice 'EXCHANGE PARTITION SCRIPT: %', ext_sql;
+	execute ext_sql;
+	
+	ext_where = ''||p_partition_key||' >= '''||ext_start_date||'''::date and '||p_partition_key||' < '''||ext_end_date||'''::date'; 
+	execute 'SELECT COUNT(1) FROM '||table_name||' WHERE '||ext_where into res;
+	return res::int;
+end;
+
+
+$$
+EXECUTE ON ANY;
